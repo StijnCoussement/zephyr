@@ -24,6 +24,7 @@ static const uint8_t REG_MANUFACTURER_ID[]       = {0x37, 0x81};
 static const uint8_t REG_SOFT_RESET[]            = {0x30, 0xA2};
 static const uint8_t REG_READ_STATUS[]           = {0xF3, 0x2D};
 static const uint8_t REG_RESET_STATUS[]          = {0x30, 0x41};
+static const uint8_t REG_OFFSET[]                = {0xA0, 0x04};
 /* Alert status registers */
 static const uint8_t alert_set_commands[][2] = {
     {0x61, 0x00},
@@ -52,6 +53,12 @@ static const uint8_t alert_read_commands[][2] = {
 #define RH_SCALE 100U
 #define TEMP_OFFSET -45
 #define TEMP_SCALE 175U
+/* Temperature offset: 7-bit value, max ±21.704101°C, 0.1708984375°C per bit */
+#define TEMP_OFFSET_SCALE 170.8984375f
+/* Humidity offset: 7-bit value, max ±24.8046875%, 0.1953125% per bit */
+#define HUMIDITY_OFFSET_SCALE 19.53125f
+/* EEPROM write timeout  in milliseconds (53–77 ms, use 80 ms to be safe) */
+#define EEPROM_WRITE_TIME_OUT 80
 
 /* Conversion direction enum */
 typedef enum {
@@ -196,7 +203,7 @@ static void convert_sensor_value(uint16_t *raw_value, struct sensor_value *senso
         } else {
             *raw_value = (uint16_t)raw_calc;
         }
-        LOG_INF("Converted sensor value: %d.%06d to raw value: %x", sensor_val->val1, sensor_val->val2, *raw_value);
+        LOG_DBG("Converted sensor value: %d.%06d to raw value: %x", sensor_val->val1, sensor_val->val2, *raw_value);
     }
 }
 
@@ -352,34 +359,34 @@ static int ti_hdc302x_channel_get(const struct device *dev,
 static void log_status_bits(uint16_t status)
 {
     if (status & TI_HDC302X_STATUS_REG_BIT_ALERT) {
-        LOG_INF("Alert: At least one active alert");
+        LOG_DBG("Alert: At least one active alert");
     }
     if (status & TI_HDC302X_STATUS_REG_BIT_HEATER_ON) {
-        LOG_INF("Alert: Heater is ON");
+        LOG_DBG("Alert: Heater is ON");
     }
     if (status & TI_HDC302X_STATUS_REG_BIT_RH_ALERT) {
-        LOG_INF("Alert: RH alert active");
+        LOG_DBG("Alert: RH alert active");
     }
     if (status & TI_HDC302X_STATUS_REG_BIT_TEMP_ALERT) {
-        LOG_INF("Alert: Temperature alert active");
+        LOG_DBG("Alert: Temperature alert active");
     }
     if (status & TI_HDC302X_STATUS_REG_BIT_RH_HIGH_ALERT) {
-        LOG_INF("Alert: RH high threshold exceeded");
+        LOG_DBG("Alert: RH high threshold exceeded");
     }
     if (status & TI_HDC302X_STATUS_REG_BIT_RH_LOW_ALERT) {
-        LOG_INF("Alert: RH low threshold exceeded");
+        LOG_DBG("Alert: RH low threshold exceeded");
     }
     if ((status >> 8) & TI_HDC302X_STATUS_REG_BIT_TEMP_HIGH_ALERT) {
-        LOG_INF("Alert: Temperature high threshold exceeded");
+        LOG_DBG("Alert: Temperature high threshold exceeded");
     }
     if ((status >> 8) & TI_HDC302X_STATUS_REG_BIT_TEMP_LOW_ALERT) {
-        LOG_INF("Alert: Temperature low threshold exceeded");
+        LOG_DBG("Alert: Temperature low threshold exceeded");
     }
     if ((status >> 8) & TI_HDC302X_STATUS_REG_BIT_RESET_DETECTED) {
-        LOG_INF("Alert: Reset detected");
+        LOG_DBG("Alert: Reset detected");
     }
     if ((status >> 8) & TI_HDC302X_STATUS_REG_BIT_CRC_FAILED) {
-        LOG_INF("Alert: CRC failure detected");
+        LOG_DBG("Alert: CRC failure detected");
     }
 }
 
@@ -560,7 +567,80 @@ static int set_threshold(const struct device *dev,
     return 0;
 }
 
-static int convert_offset(uint8_t *offset, int16_t raw_offset, double scale)
+static void convert_offset_to_value(uint8_t offset, int16_t *raw_offset, double scale)
+{
+    bool add = true;
+    if ((offset & 0x80) == 0) {
+        add = false;
+    }
+    int16_t offset_bits = offset & 0x7F;
+    *raw_offset = (add ? 1 : -1) * offset_bits * scale;
+}
+
+static bool convert_offset_to_temperature(uint8_t offset, struct sensor_value *val)
+{
+    int16_t temp_offset_mdeg;
+    convert_offset_to_value(offset, &temp_offset_mdeg, TEMP_OFFSET_SCALE);
+
+    val->val1 = temp_offset_mdeg / 1000; // Convert to degrees Celsius
+    val->val2 = (temp_offset_mdeg % 1000) * 1000; // Convert to microdegrees Celsius
+
+    LOG_DBG("Converted temperature offset: %d.%06d from raw value: %x", val->val1, val->val2, offset);
+    return true;
+}
+
+static bool convert_offset_to_humidity(uint8_t offset, struct sensor_value *val)
+{
+    int16_t rh_offset_mdeg;
+    convert_offset_to_value(offset, &rh_offset_mdeg, HUMIDITY_OFFSET_SCALE);
+
+    val->val1 = rh_offset_mdeg / 100; // Convert to percent
+    val->val2 = (rh_offset_mdeg % 100) * 10000; // Convert to micropercent
+
+    LOG_DBG("Converted humidity offset: %d.%06d from raw value: %x", val->val1, val->val2, offset);
+    return true;
+}
+
+static int get_offset(const struct device *dev,
+                    enum sensor_channel chan,
+                    struct sensor_value *val)
+{
+    struct ti_hdc302x_data *data = dev->data;
+    int rc = 0;
+    uint8_t buf[3];
+
+    rc = write_command(dev, REG_OFFSET, sizeof(REG_OFFSET));
+    if (rc < 0) {
+        LOG_ERR("Failed to request offset readout");
+    }
+    rc = read_sensor_data(dev, (uint8_t *)buf, sizeof(buf));
+	if (rc < 0) {
+		LOG_ERR("Failed to read offset data");
+		return rc;
+	}
+    if (!verify_crc(&buf[0], 2, buf[2])) {
+        LOG_ERR("Offset CRC verification failed");
+        return -EIO;
+    }
+    data->rh_offset = buf[0];
+    data->t_offset = buf[1];
+
+    switch (chan)
+    {
+    case SENSOR_CHAN_HUMIDITY:
+        return convert_offset_to_humidity(data->rh_offset, val);
+
+    case SENSOR_CHAN_AMBIENT_TEMP:
+        return convert_offset_to_temperature(data->t_offset, val);
+    
+    default:
+        break;
+    }
+
+    return 0;
+}
+
+static int convert_offset_to_sensor(uint8_t *offset, int16_t raw_offset, double scale)
 {
     bool add = true;
     if(raw_offset < 0) {
@@ -568,7 +648,6 @@ static int convert_offset(uint8_t *offset, int16_t raw_offset, double scale)
         raw_offset = -raw_offset; // Make value positive for conversion
     }
 
-    /* Temperature offset: 7-bit value, max ±21.704101°C, 0.1708984375°C per bit */
     int16_t offset_bits = raw_offset / scale; /* m°C to bits */
     if (offset_bits < 0 || offset_bits > 127) {
         LOG_ERR("offset out of range!");
@@ -578,19 +657,24 @@ static int convert_offset(uint8_t *offset, int16_t raw_offset, double scale)
     return 0;
 }
 
-static bool convert_temperature_offset(uint8_t *offset, struct sensor_value *val)
+static bool convert_temperature_to_offset(uint8_t *offset, const struct sensor_value *val)
 {
     int16_t temp_offset_mdeg = val->val1 * 1000 + val->val2 / 1000;
-    convert_offset(offset, temp_offset_mdeg, 170.8984375);
-    LOG_INF("Converted temperature offset: %d.%06d to raw value: %x", val->val1, val->val2, *offset);
+    
+    if(convert_offset_to_sensor(offset, temp_offset_mdeg, TEMP_OFFSET_SCALE) != 0) {
+        return false;
+    }
+    LOG_DBG("Converted temperature offset: %d.%06d to raw value: %x", val->val1, val->val2, *offset);
     return true;
 }
 
-static bool convert_humidity_offset(uint8_t *offset, struct sensor_value *val)
+static bool convert_humidity_to_offset(uint8_t *offset, const struct sensor_value *val)
 {
     int16_t rh_offset_crh = val->val1 * 100 + val->val2 / 10000;
-    convert_offset(offset, rh_offset_crh, 19.53125);
-    LOG_INF("Converted humidity offset: %d.%06d to raw value: %x", val->val1, val->val2, *offset);
+    if(convert_offset_to_sensor(offset, rh_offset_crh, HUMIDITY_OFFSET_SCALE) != 0) {
+        return false;
+    }
+    LOG_DBG("Converted humidity offset: %d.%06d to raw value: %x", val->val1, val->val2, *offset);
     return true;
 }
 
@@ -600,21 +684,25 @@ static int set_offset(const struct device *dev,
 {
     struct ti_hdc302x_data *data = dev->data;
     uint16_t rc = 0;
+    struct sensor_value *tmp_val;
 
     if(data->interval != HDC302X_SENSOR_MEAS_INTERVAL_MANUAL) {
         LOG_ERR("Cannot set offset in automatic mode");
         return -EINVAL;
     }
 
+    // Get current offset values so we do not overwrite the one that is not set here.
+    get_offset(dev, chan, tmp_val);
+
     switch (chan) {
     case SENSOR_CHAN_AMBIENT_TEMP:
-        if(convert_temperature_offset(&data->t_offset, (struct sensor_value *)val) == false) {
+        if(convert_temperature_to_offset(&data->t_offset, val) == false) {
             LOG_ERR("Invalid temperature offset value: %d.%06d", val->val1, val->val2);
             return -EINVAL;
         }
         break;
     case SENSOR_CHAN_HUMIDITY:
-        if(convert_humidity_offset(&data->rh_offset, (struct sensor_value *)val) == false) {
+        if(convert_humidity_to_offset(&data->rh_offset, val) == false) {
             LOG_ERR("Invalid humidity offset value: %d.%06d", val->val1, val->val2);
             return -EINVAL;
         }
@@ -626,8 +714,7 @@ static int set_offset(const struct device *dev,
 
     /* Prepare command to write offset */
     uint8_t buf[5];
-    buf[0] = 0xA0;
-    buf[1] = 0x04;
+    memcpy(buf, REG_OFFSET, sizeof(REG_OFFSET));
     buf[2] = data->rh_offset;
     buf[3] = data->t_offset;
     buf[4] = calculate_crc(&buf[2], 2); // Calculate CRC for the data
@@ -638,9 +725,7 @@ static int set_offset(const struct device *dev,
         LOG_ERR("Failed to set offset: %d", rc);
         return rc;
     }
-    /* Wait for EEPROM write (53–77 ms, use 80 ms to be safe) */
-    k_msleep(80);
-
+    k_msleep(EEPROM_WRITE_TIME_OUT);
     return 0;
 }
 
@@ -663,6 +748,14 @@ static int ti_hdc302x_attr_get(const struct device *dev, enum sensor_channel cha
         default:
             LOG_ERR("Unsupported GET attribute: %d", attr);
             return -ENOTSUP;
+        }
+    } else {
+        switch (attr) {
+        case SENSOR_ATTR_OFFSET:
+            get_offset(dev, chan, val);
+            return 0;
+        default:
+            break;
         }
     }
     return -ENOTSUP;
@@ -811,7 +904,7 @@ static int ti_hdc302x_init(const struct device *dev)
         k_sem_init(&data->sem_int, 0, K_SEM_MAX_LIMIT);
     }
 
-    LOG_INF("HDC302x sensor initialized successfully");
+    LOG_DBG("HDC302x sensor initialized successfully");
     return 0;
 }
 
