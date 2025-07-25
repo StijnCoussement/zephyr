@@ -25,6 +25,10 @@ static const uint8_t REG_SOFT_RESET[]            = {0x30, 0xA2};
 static const uint8_t REG_READ_STATUS[]           = {0xF3, 0x2D};
 static const uint8_t REG_RESET_STATUS[]          = {0x30, 0x41};
 static const uint8_t REG_OFFSET[]                = {0xA0, 0x04};
+static const uint8_t REG_HEATER_ON[]             = {0x30, 0x6D};
+static const uint8_t REG_HEATER_OFF[]            = {0x30, 0x66};
+static const uint8_t REG_HEATER_LEVEL[]          = {0x30, 0x6E};
+
 /* Alert status registers */
 static const uint8_t alert_set_commands[][2] = {
     {0x61, 0x00},
@@ -493,10 +497,10 @@ static int read_threshold(const struct device *dev,
         return rc;
     }
     rc = read_sensor_data(dev, (uint8_t *)buf, sizeof(buf));
-	if (rc < 0) {
-		LOG_ERR("Failed to read Alert data");
-		return rc;
-	}
+    if (rc < 0) {
+        LOG_ERR("Failed to read Alert data");
+        return rc;
+    }
 
     convert_alert_threshold(data, buf);
     convert_temperature(&data->t_alert, &temp, RAW_TO_SENSOR);
@@ -614,10 +618,10 @@ static int get_offset(const struct device *dev,
         LOG_ERR("Failed to request offset readout");
     }
     rc = read_sensor_data(dev, (uint8_t *)buf, sizeof(buf));
-	if (rc < 0) {
-		LOG_ERR("Failed to read offset data");
-		return rc;
-	}
+    if (rc < 0) {
+        LOG_ERR("Failed to read offset data");
+        return rc;
+    }
     if (!verify_crc(&buf[0], 2, buf[2])) {
         LOG_ERR("Offset CRC verification failed");
         return -EIO;
@@ -684,15 +688,14 @@ static int set_offset(const struct device *dev,
 {
     struct ti_hdc302x_data *data = dev->data;
     uint16_t rc = 0;
-    struct sensor_value *tmp_val;
+    struct sensor_value tmp_val = {0};
 
     if(data->interval != HDC302X_SENSOR_MEAS_INTERVAL_MANUAL) {
         LOG_ERR("Cannot set offset in automatic mode");
         return -EINVAL;
     }
-
     // Get current offset values so we do not overwrite the one that is not set here.
-    get_offset(dev, chan, tmp_val);
+    get_offset(dev, chan, &tmp_val);
 
     switch (chan) {
     case SENSOR_CHAN_AMBIENT_TEMP:
@@ -726,6 +729,57 @@ static int set_offset(const struct device *dev,
         return rc;
     }
     k_msleep(EEPROM_WRITE_TIME_OUT);
+    return 0;
+}
+
+static int set_heater_level(const struct device *dev,
+                    enum sensor_channel chan,
+                    const struct sensor_value *val)
+{
+    struct ti_hdc302x_data *data = dev->data;
+    uint8_t buf[5];
+    uint16_t heater_level = 0x3FFF; // Default to maximum heater level
+    int rc;
+
+    if (val->val1 > 14 || val->val1 < 0) {
+        LOG_ERR("Heater level out of range: %d", val->val1);
+        return -EINVAL;
+    }
+
+    if(val->val1 == 0)
+    {
+        // If heater level is set to 0, we need to clear the heater status
+        rc = write_command(dev, REG_HEATER_OFF, 2);
+        if (rc < 0) {
+            LOG_ERR("Failed to disable heater: %d", rc);
+            return rc;
+        }
+        LOG_DBG("Heater disabled");
+    } else {
+        // shift the heater level bits to match the expected level
+        heater_level = heater_level >> (14 - val->val1);
+
+        // Prepare command to write heater level
+        memcpy(buf, REG_HEATER_LEVEL, sizeof(REG_HEATER_LEVEL));
+        buf[2] = (heater_level >> 8) & 0xFF;
+        buf[3] = heater_level & 0xFF;
+        buf[4] = calculate_crc(&buf[2], 2); // Calculate CRC
+
+        rc = write_command(dev, buf, sizeof(buf));
+        if (rc < 0) {
+            LOG_ERR("Failed to set heater level: %d", rc);
+            return rc;
+        }
+
+        // If heater level is set to non-zero, we need to enable the heater
+        rc = write_command(dev, REG_HEATER_ON, 2);
+        if (rc < 0) {
+            LOG_ERR("Failed to enable heater: %d", rc);
+            return rc;
+        }
+        LOG_DBG("Heater enabled at level %d", val->val1);
+    }
+
     return 0;
 }
 
@@ -784,7 +838,9 @@ static int ti_hdc302x_attr_set(const struct device *dev, enum sensor_channel cha
             }
             data->interval = (enum sensor_measurement_interval_hdc302x)val->val1;
             return set_power_mode_and_interval(dev);
-
+        case SENSOR_ATTR_HEATER_LEVEL:
+            set_heater_level(dev, chan, val);
+            break;
         default:
             LOG_ERR("Unsupported SET attribute: %d", attr);
             return -ENOTSUP;

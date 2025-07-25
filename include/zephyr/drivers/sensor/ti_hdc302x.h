@@ -60,6 +60,8 @@ enum sensor_attribute_hdc302x {
 	SENSOR_ATTR_INTEGRATION_TIME,
     /* Sensor status register */
     SENSOR_ATTR_STATUS_REGISTER,
+    /* Sensor heater level */
+    SENSOR_ATTR_HEATER_LEVEL, // Heater level (0-14)
 };
 
 enum sensor_power_mode_hdc302x {
